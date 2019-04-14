@@ -1,0 +1,21 @@
+* 0.1.5 - Nuno Tavares <n.tavares@portavita.eu>
+  FIX autoRelease claimRef/claim_ref bug, ADD process autoRelease when e.type=ADDED, status=Released, autorRelease=true as well
+
+* 0.1.4 - Nuno Tavares <n.tavares@portavita.eu>
+  MOD add timestamps to log entries
+  ADD autoRelease feature, allowing the PV to free itself from Released (by clearing up claimRef) when the bound PVC is removed.
+
+* 0.1.3
+  FIX typo
+
+* 0.1.2 - Nuno Tavares <n.tavares@portavita.eu>
+  FIX the empty list of sanity-check output.
+  ADD command-line options
+  MOD sanity-checks, and debugging as an option.
+  ADD more info messages, in case debugging is off, for better following what's going on.
+
+* 0.1.1 - Nuno Tavares <n.tavares@portavita.eu>
+  ADD VERSION file, for versioning
+  FIX output is not a string, it seems
+
+

@@ -1,0 +1,165 @@
+#
+# This is a battery of tests to certify error control. Nearly all PVs are syntactically wrong,
+# and the ones that aren't are meant to allow inspection on the mutations after provisioning.
+#
+# After testing, clean up with:
+# kubectl delete pv $(grep "  name: " test/pv-with-errors.yaml | awk '{print $2}' | xargs)
+#
+---
+# Expected result: Provisioned, and persistentVolumeReclaimPolicy => Retain (besides control annotations)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-noannotations
+  annotations:
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pv/test-local-pv-vol-noannotations
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node09
+
+---
+# Expected result: Provisioned - note that cryptSecret is not implemented as of 201808
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-allannotations
+  annotations:
+     local-pv.k8s.portavita.net/fsType: ext4
+     local-pv.k8s.portavita.net/fsOpts: -m 0 -o
+     local-pv.k8s.portavita.net/mountOpts: noexec
+     local-pv.k8s.portavita.net/vg: storage_bulk
+     local-pv.k8s.portavita.net/cryptSecret: 'xxx'
+     local-pv.k8s.portavita.net/dummyField: 'xxx'
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pv/test-local-pv-vol-allannotations
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node09
+
+---
+# Expected result: Failed provisioning, annotated Not-Processed-Errors
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-wrong-mountbase
+  annotations:
+     local-pv.k8s.portavita.net/fsType: ext4
+     local-pv.k8s.portavita.net/fsOpts: -m 0
+     local-pv.k8s.portavita.net/mountOpts: noexec
+     local-pv.k8s.portavita.net/vg: storage_bulk
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pvwrong/test-local-pv-vol-wrong-mountbase
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node09
+
+---
+# Expected result: Failed provisioning, annotated Not-Processed-Errors
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-localpath-mismatch
+  annotations:
+     local-pv.k8s.portavita.net/fsType: ext4
+     local-pv.k8s.portavita.net/fsOpts: -m 0 -o
+     local-pv.k8s.portavita.net/mountOpts: noexec
+     local-pv.k8s.portavita.net/vg: storage_bulk
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pv/test-local-pv-vol-mismatch-localpath
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node09
+
+---
+# Expected result: Failed provisioning, annotated Not-Processed-Errors
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-nonodeaffinity
+  annotations:
+     local-pv.k8s.portavita.net/fsType: ext4
+     local-pv.k8s.portavita.net/fsOpts: -m 0 -o
+     local-pv.k8s.portavita.net/mountOpts: noexec
+     local-pv.k8s.portavita.net/vg: storage_bulk
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pv/test-local-pv-vol-nonodeaffinity
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/wrong-tag
+          operator: In
+          values:
+          - node09
+
+---
+# Expected result: Provisioning skipped/ignored, it's not meant for us
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol-nospeclocalpath
+spec:
+  capacity:
+    storage: 1Mi
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    # FIXME: use the right IP
+    server: 10.999.999.999
+    path: "/"

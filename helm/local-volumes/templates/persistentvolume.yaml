@@ -1,0 +1,35 @@
+{{- range $.Values.nodes }}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+    local-pv.k8s.portavita.net/fsType: {{ $.Values.fs }}
+    local-pv.k8s.portavita.net/fsOpts: {{ $.Values.opts }}
+    local-pv.k8s.portavita.net/mountOpts: {{ $.Values.mountOpts }}
+    local-pv.k8s.portavita.net/vg: {{ $.Values.vg }}
+  name: {{ $.Values.storageClass }}-{{ . }}
+  labels:
+    app: {{ $.Release.Name }}-{{ $.Chart.Name }}-{{ $.Chart.Version | replace "+" "_" }}
+    chart: {{ $.Chart.Name }}-{{ $.Chart.Version | replace "+" "_" }}
+    release: {{ $.Release.Name }}
+    heritage: {{ $.Release.Service }}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: {{ $.Values.size }}
+  local:
+    path: /mnt/pv/{{ $.Values.storageClass }}-{{ . }}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid 
+          operator: In
+          values:
+          - {{ . }}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ $.Values.storageClass }}
+{{ end }}
+

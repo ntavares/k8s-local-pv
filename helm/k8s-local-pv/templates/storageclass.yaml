@@ -1,0 +1,12 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: k8s-local-pv
+volumeBindingMode: WaitForFirstConsumer
+provisioner: {{ template "k8s-local-pv.name" . }}-provisioner
+allowVolumeExpansion: false
+#parameters:
+#  volumeOptionsDefault:
+#    fsType: ext4
+#    mountOpts: noexec
+#    volumeGroup: storage_bulk

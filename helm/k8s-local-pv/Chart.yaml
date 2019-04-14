@@ -1,0 +1,4 @@
+apiVersion: v1
+description: Portavita local volume provisioner
+name: k8s-local-pv
+version: 0.1.1

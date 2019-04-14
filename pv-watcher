@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+#
+# NOTES:
+# * This is not a provisioner designed for the CSI, but rather a watcher
+#   that listens for (manually-created) PersistentVolumes and reacts upon them (performing the physical
+#   provisioning of the volumes) and patching the PV with meta-information.
+# * As of 201808, we enforce persistentVolumeReclaimPolicy=Retain as it's implicit that a manual delete of a PV
+#   means that we don't want the volume anymore, and therefore we rely on it to perform cleanup.
+#
+#
+# REFERENCES:
+# https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/CoreV1Api.md#list_persistent_volume
+#
+# (c) 2018, Nuno Tavares <n.tavares@portavita.eu>
+
+import sys
+from kubernetes import client, config, watch
+import os
+from kubernetes.config import ConfigException
+
+#from pprint import pprint
+from kubernetes.client.rest import ApiException
+
+import subprocess
+from subprocess import Popen, PIPE
+import re
+import argparse
+import datetime
+
+class PortavitaPVWatcher:
+
+    PV_ANNOTATION_PREFIX = 'local-pv.k8s.portavita.net'
+    PATH_PROVISIONER = '/root/static-pv-provisioner'
+    MYHOST = None
+    PV_NODELABEL_KEY = 'node-id.k8s.portavita.net/nodeid'
+    OPTIONS = {}
+
+    # This path is where all mountpoints will be, and must exist on the nodes
+    # Recommened: setup a tmpfs file to hold the directory entries
+    MOUNTBASEPATH = '/mnt/pv'
+
+    apic = None
+
+    def __init__(self, options):
+        # Could not find a way to expose a node label into the container, so we're
+        # reproducing the regex taken from: https://crucible.portavita.nl:6443/changelog/ansible?cs=b605b25e4041c25595c8a3dd196876ae0335c990
+        # Note: we could also obtain the labels by querying the API, but...
+        self.MYHOST = re.sub(r'^.*[^0-9]+([0-9]+)$', r'node\1', os.environ['HOSTNAME'])
+        self.OPTIONS = options
+        if self.OPTIONS.debug:
+            self.PATH_PROVISIONER += ' -v'
+        self.debug('MYHOST = %s' % self.MYHOST)
+        return
+
+    def _getApiClient(self):
+        return self.apic
+
+    def loadConfig(self):
+        # Configs can be set in Configuration class directly or using helper utility
+        try:
+            # NOTE should be possible to rebuild the Configuration from the ENV token, etc.
+            self.info("Attempting to initialize with load_incluster_config()")
+            config.load_incluster_config()
+        except ConfigException:
+            self.info("Attempting to initialize with load_kube_config(), after load_incluster_config() failed.")
+            config.load_kube_config()
+        except ConfigException:
+            self.error("Failed to initialize")
+            sys.exit(1)
+        if self.OPTIONS.debug:
+            client.configuration.debug = True
+        self.apic = client.CoreV1Api()
+
+    #
+    # TODO - load from configmap (or storageclass parameters)
+    #
+    def _loadDefaultVolumeConfig(self):
+        config = { 'fsType': 'ext4', 'mountOpts': 'noexec', 'vg': 'storage_bulk', 'fsOpts': '', 'cryptSecret': '' }
+        return config
+
+    #
+    # We're counting on Kubernetes own validator for a few assumptions.
+    # Return value of False means "fail with error", True might mean "all good, proceed", or "ignore",
+    # you'll have to inspect the contents of the message returned.
+    #
+    def _validateSyntax(self, obj):
+        local_path_specified = (
+            hasattr(obj.spec, 'local')
+            and hasattr(obj.spec.local, 'path')
+        )
+        if not local_path_specified:
+            return True, 'NOT-FOR-ME-NO-LOCAL-PATH'
+
+        node_affinity_syntax_complete = (
+            hasattr(obj.spec, 'node_affinity')
+            and hasattr(obj.spec.node_affinity, 'required')
+            and hasattr(obj.spec.node_affinity.required, 'node_selector_terms')
+            and isinstance(obj.spec.node_affinity.required.node_selector_terms, list)
+            and (len(obj.spec.node_affinity.required.node_selector_terms)>0)
+            and hasattr(obj.spec.node_affinity.required.node_selector_terms[0], 'match_expressions')
+            and isinstance(obj.spec.node_affinity.required.node_selector_terms[0].match_expressions, list)
+            and (len(obj.spec.node_affinity.required.node_selector_terms[0].match_expressions)>0)
+            and hasattr(obj.spec.node_affinity.required.node_selector_terms[0].match_expressions[0], 'key')
+            and (obj.spec.node_affinity.required.node_selector_terms[0].match_expressions[0].key == self.PV_NODELABEL_KEY)
+        )
+
+        if not node_affinity_syntax_complete:
+            return False, 'spec.nodeAffinity.required.nodeSelectorTerms.matchExpressions path not found, or not complete!'
+
+        return True, ''
+
+    #
+    # This probably could be more robust/flexible (otherwise the nodeAffinity section
+    # should be crystalized in the docs)
+    #
+    def _getNodeAffinity(self, objSpec):
+        #self.debug(str(objSpec))
+        for term in objSpec.node_affinity.required.node_selector_terms:
+            for exp in term.match_expressions:
+                if exp.key == self.PV_NODELABEL_KEY:
+                    return exp.values[0]
+        return None
+
+    def _getVolumeOptions(self, objMetadataAnnotations):
+        config = self._loadDefaultVolumeConfig()
+        self.debug("config = " + str(config))
+
+        # If no annotations were specified, we will default everything
+        if not isinstance(objMetadataAnnotations, dict):
+            objMetadataAnnotations = {}
+
+        # Nasty, I don't know how to get an attribute like that lol
+        for ann, value in objMetadataAnnotations.iteritems():
+            if ann.startswith(self.PV_ANNOTATION_PREFIX + '/'):
+                key = ann.replace(self.PV_ANNOTATION_PREFIX + '/', '')
+                if key not in ['cryptSecret', 'fsType', 'mountOpts', 'vg', 'fsOpts', 'size', 'mountPoint', 'node', 'status', 'autoRelease']:
+                    self.info('WARNING: Ignoring invalid option "' + self.PV_ANNOTATION_PREFIX + '/' + key + '".')
+                if key not in ['status']:
+                    config[key] = value
+        return config
+
+    def _getAnnotation(self, objMetadataAnnotations, strAnnotation, strValue=None):
+        # If no annotations were specified, we will default everything
+        if not isinstance(objMetadataAnnotations, dict):
+            objMetadataAnnotations = {}
+        if strAnnotation in objMetadataAnnotations.keys():
+            if not strValue:
+                return True
+            return (objMetadataAnnotations[strAnnotation].upper() == strValue.upper())
+
+    #
+    # TODO ....
+    #
+    def _getSecret(self, secretName):
+        return ''
+
+    #
+    # Some basic sanityChecks...
+    #
+    def runSanityChecks(self):
+        self.debug("runSanityChecks() - starting")
+        if not self.OPTIONS.sanity_checks:
+            self.info('Skipping sanity-checks, as per command line options')
+            return True
+
+        cmdStr = self.PATH_PROVISIONER + " -A list-local"
+        self.debug('cmdStr = ' + cmdStr)
+        retcode, output = self._runShellCommand(cmdStr + ' 1>&2', True)
+        if retcode != 0:
+            return False
+
+        # clean up eventual blank lines
+        mplist = [s for s in output.split('\n') if len(s.strip())>0]
+        if len(mplist)<=0:
+            self.debug("No local mountpoints returned by static-pv-provisioner (that's ok!)")
+            return True
+
+        self.info('Local mountpoints returned by static-pv-provisioner: "')
+        self.info( str(mplist) )
+        for mp in mplist:
+            self.debug('+ Checking Kubernetes API for the existence of a PV named: ' + mp)
+            try:
+                api_response = self._getApiClient().read_persistent_volume(mp, pretty='false', exact=True, export=False)
+                #self.debug( str(api_response) )
+            except ApiException as e:
+                self.info('WARNING: (Possibly stale) mountpoint found: %s. No PersistentVolume exists for this mountpoint!' % mp)
+                # Now, further than this would require inspection via the static-pv-provisioner, and I think it's enough :-)
+                # This warning should be enough to trigger some inspection, no?
+        return True
+
+    def run(self):
+        count = 10
+        w = watch.Watch()
+        while True:
+            for event in w.stream(self._getApiClient().list_persistent_volume, _request_timeout=0):
+                o = event['object']
+                self.debug("event.type: %s, name: %s, status: %s" % (event['type'], o.metadata.name, o.status.phase))
+                #self.debug(str(o))
+
+                if event['type'] not in ['ADDED', 'DELETED'] and not self.OPTIONS.pvc_auto_release:
+                    self.debug("Ignored action: %s, reason: NO-OP" % event['type'])
+                    continue
+
+                r, msg = self._validateSyntax(o)
+                #self.debug('_validateSyntax() = %s, %s' % (str(r), msg))
+                if not r:
+                    self.error(msg)
+                    continue
+                elif len(msg)>0:
+                    self.info("Ignored action: %s, reason: %s" % (event['type'], msg))
+                    continue
+
+                selectedNode = self._getNodeAffinity(o.spec)
+                if not selectedNode:
+                    self.error("Could not extract nodeAffinity")
+                    self.patchPersistentVolumeObject(event['object'].metadata.name, None, False)
+                    continue
+
+                if self.MYHOST != selectedNode:
+                    self.info("Ignored action: %s, node: %s, reason: NOT-FOR-ME" % (event['type'], selectedNode))
+                    continue
+
+                if event['type'] == 'ADDED':
+                    config = self._getVolumeOptions(o.metadata.annotations)
+                    if not config:
+                        self.info("Got action: %s, node: %s, volume: Errors found, see below." % (event['type'], selectedNode))
+                        self.error('Cannot process PersistentVolume "' + o.metadata.name + '" due to previous errors')
+                        self.patchPersistentVolumeObject(event['object'].metadata.name, config, False)
+                        continue
+                    self.info("Got action: %s, node: %s, volume: %s." % (event['type'], selectedNode, o.metadata.name))
+                    # Note that if the pod was restarted before it could react on a event.type=MODIFIED, autoRelease=true, it won't be
+                    # able to react ever more, as once restarted, the PVs are shown as ADDED
+                    if o.status.phase in ['Released']:
+                        #self.debug('phase=' + o.status.phase + ', pvc_auto_release=' + str(self.OPTIONS.pvc_auto_release) + ', _getAnnotation=' + str(self._getAnnotation(o.metadata.annotations, self.PV_ANNOTATION_PREFIX + '/autoRelease', 'true')) + ', hasattr=' + str(hasattr(o.spec, 'claim_ref')))
+                        if self.OPTIONS.pvc_auto_release and self._getAnnotation(o.metadata.annotations, self.PV_ANNOTATION_PREFIX + '/autoRelease', 'true') and hasattr(o.spec, 'claim_ref') and o.spec.claim_ref:
+                            self.info("Removing spec.claimRef from '" + o.metadata.name + "', as pvcAutoRelease=on and requested by PV annotation")
+                            body = [{ "op": "remove", "path": "/spec/claimRef" }]
+                            self.patchPersistentVolumeManifest(o.metadata.name, body)
+                    else:
+                        config['size'] = o.spec.capacity['storage']
+                        provStatus = self.provisionHostPath(o.metadata.name, o.spec.local.path, config)
+                        self.patchPersistentVolumeObject(o.metadata.name, config, provStatus)
+                elif event['type'] == 'DELETED':
+                    self.info("Got action: %s, node: %s, volume: %s" % (event['type'], selectedNode, o.metadata.name))
+                    self.deprovisionHostPath(o.metadata)
+                elif event['type'] == 'MODIFIED':
+                    #self.debug('phase=' + o.status.phase + ', pvc_auto_release=' + str(self.OPTIONS.pvc_auto_release) + ', _getAnnotation=' + str(self._getAnnotation(o.metadata.annotations, self.PV_ANNOTATION_PREFIX + '/autoRelease', 'true')) + ', hasattr=' + str(hasattr(o.spec, 'claim_ref')))
+                    if o.status.phase in ['Released'] and self.OPTIONS.pvc_auto_release and self._getAnnotation(o.metadata.annotations, self.PV_ANNOTATION_PREFIX + '/autoRelease', 'true') and hasattr(o.spec, 'claim_ref') and o.spec.claim_ref:
+                        self.info("Removing spec.claimRef from '" + o.metadata.name + "', as pvcAutoRelease=on and requested by PV annotation")
+                        body = [{ "op": "remove", "path": "/spec/claimRef" }]
+                        self.patchPersistentVolumeManifest(o.metadata.name, body)
+
+        self.info("Terminated.")
+
+    def provisionHostPath(self, objMetadataName, objSpecLocalPath, objConfig):
+        self.debug("provisionHostPath(objMetadataName=%s)" % (objMetadataName))
+
+        # TODO Because spec.local.path has to be used (see sysadmin-pv.yaml),
+        # we should check if someone is attempting to specify a path out of self.MOUNTBASEPATH
+        if not objSpecLocalPath.startswith(self.MOUNTBASEPATH + '/'):
+            self.error('The specciied spec.local.path (' + objSpecLocalPath + ') does not start in MOUNTBASEPATH=' + self.MOUNTBASEPATH)
+            return False
+
+        # This logic actually belongs to static-pv-provisioner, but we try to intercept it here anyway...
+        # We bluntly fail here because static-pv-provisioner has been already changed to "-P MOUNTBASEPATH"
+        # (attempting to get rid of spec.local.path...). There's probably no technical problem in having
+        # a PV name that would result in a "downstreamPath" different than spec.local.path, but it just looks
+        # like too much freedom to me that an user can arbitrarily specify it's own path.
+        downstreamPath = self.MOUNTBASEPATH + '/' + objMetadataName
+        if objSpecLocalPath != downstreamPath:
+            self.error('The specified spec.local.path (' + objSpecLocalPath + ') differs from the calculated path (' + downstreamPath + '), which is unnaceptable')
+            return False
+
+        cmdStr = self.PATH_PROVISIONER + " -A add -N '" +  objMetadataName + "' -P '" + self.MOUNTBASEPATH + "' -O '" + objConfig['mountOpts'] + "' -T '" + objConfig['fsType'] + "' -V '" + objConfig['vg'] + "' -F '" + objConfig['fsOpts'] + "' -S '" + objConfig['size'] + "'"
+        if 'cryptSecret' in objConfig:
+            cmdStr += " -E '" + self._getSecret(objConfig['cryptSecret']) + "'"
+        self.debug('cmdStr = ' + cmdStr)
+        retcode, output = self._runShellCommand(cmdStr)
+        if retcode != 0:
+            return False
+
+        return True
+
+    def patchPersistentVolumeObject(self, objMetadataName, objConfig, success=True):
+        self.debug("patchPersistentVolumeObject(%s, %s)" % (objMetadataName, success) )
+        body = { 'metadata': { 'annotations': {} }, 'spec': {}, 'status': {} }
+
+        if success:
+            body['metadata']['annotations'][self.PV_ANNOTATION_PREFIX + '/status'] = 'Processed'
+            body['metadata']['annotations'][self.PV_ANNOTATION_PREFIX + '/mountPoint'] = self.MOUNTBASEPATH + '/' + objMetadataName
+
+            # Can't do this: "PersistentVolume \"xxxxxxxxx\" is invalid: spec.persistentvolumesource: Forbidden: is immutable after creation"
+            #body['spec']['local']= { 'path': self.MOUNTBASEPATH + '/' + objMetadataName }
+
+            # Enforce Retain persistentVolumeReclaimPolicy, see:
+            # https://github.com/kubernetes-incubator/external-storage/issues/782
+            body['spec']['persistentVolumeReclaimPolicy'] = 'Retain'
+
+            for cnf, value in objConfig.iteritems():
+                body['metadata']['annotations'][self.PV_ANNOTATION_PREFIX + '/' + cnf] = value
+
+        else:
+            body['metadata']['annotations'][self.PV_ANNOTATION_PREFIX + '/status'] = 'Not-Processed-Errors'
+            # The following would apply to patch_persistent_volume_status(), but see NOTE001 :-/
+            #body['status']['phase'] = 'Failed'
+
+        pretty = 'true' # str | If 'true', then the output is pretty printed. (optional)
+        try:
+            api_response = self._getApiClient().patch_persistent_volume(objMetadataName, body, pretty=pretty)
+            #
+            # NOTE001 - Unfortunately, the following doesn't work, K8s will reset the state to the previous state
+            #
+            #api_response = self._getApiClient().patch_persistent_volume_status(objMetadataName, body, pretty=pretty)
+        except ApiException as e:
+            self.error("Exception when calling self._getApiClient().patch_persistent_volume(): %s\n" % e)
+
+
+    def patchPersistentVolumeManifest(self, objMetadataName, objBody):
+        self.debug("patchPersistentVolumeManifest(%s, %s)" % (objMetadataName, str(objBody)) )
+
+        pretty = 'true' # str | If 'true', then the output is pretty printed. (optional)
+        try:
+            api_response = self._getApiClient().patch_persistent_volume(objMetadataName, objBody, pretty=pretty)
+        except ApiException as e:
+            self.error("Exception when calling self._getApiClient().patch_persistent_volume(): %s\n" % e)
+
+    def deprovisionHostPath(self, objMetadata):
+        self.debug("deprovisionHostPath(objMetadataName=%s)" % objMetadata.name)
+
+        # We're going to do this to get the VG details, as I can't see the mounts over there, and I'm not sure
+        # if the mountpoint is going to stay reliable in the future to allow us to trace the volume back to it's LV
+        config = self._getVolumeOptions(objMetadata.annotations)
+
+        cmdStr = self.PATH_PROVISIONER + " -A remove -N '" +  objMetadata.name + "' -P '" + self.MOUNTBASEPATH + "' -V '" + config['vg'] + "'"
+        self.debug('cmdStr = ' + cmdStr)
+
+        retcode, output = self._runShellCommand(cmdStr)
+        if retcode != 0:
+            return False
+
+        return True
+
+    def getTimestamp(self):
+        return str(datetime.datetime.now()).split('.')[0]
+
+    def info(self, msg):
+        print >> sys.stderr, "[" + self.getTimestamp() + "] INFO: " + msg
+
+    def error(self, msg):
+        print >> sys.stderr, "[" + self.getTimestamp() + "] ERROR: " + msg
+
+    def debug(self, msg):
+        if self.OPTIONS.debug:
+            print >> sys.stderr, "[" + self.getTimestamp() + "] DEBUG: " + msg
+
+    def _runShellCommand(self, strCmd, captureOutput=False):
+        self.debug("_runShellCommand: " + strCmd)
+        # dirty magic to properly handle quoted arguments
+        p = re.compile(r'''
+            '.*?' | # single quoted substring
+            ".*?" | # double quoted substring
+            \S+ # all the rest
+            ''', re.VERBOSE)
+        strCmdArgs = p.findall( strCmd )
+        strCmdArgs = [s.strip("'") for s in strCmdArgs]
+        if captureOutput:
+            p = subprocess.Popen(strCmdArgs, stdout=subprocess.PIPE)
+        else:
+            p = subprocess.Popen(strCmdArgs)
+        output = ""
+        try:
+            if captureOutput:
+                output = p.stdout.read().strip()
+                while p.poll() is None:
+                    time.sleep(0.5)
+            else:
+                p.wait()
+        except:
+            pass
+        return p.returncode, output
+
+def parseArguments():
+    parser = argparse.ArgumentParser(description='Portavita k8s-local-pv provisioner')
+    parser.add_argument('-s', '--sanity-checks', dest='sanity_checks', action='store_true', default=False, help='Enable sanity checks')
+    parser.add_argument('-v', '--debug', dest='debug', action='store_true', default=False, help='Enable debugging level messages')
+    parser.add_argument('-R', '--release', dest='pvc_auto_release', action='store_true', default=False, help='Enable PVC Automatic Release')
+    return parser.parse_args()
+
+def main():
+    options = parseArguments()
+    w = PortavitaPVWatcher(options)
+    while True:
+        try:
+            w.loadConfig()
+            w.runSanityChecks()
+            w.run()
+        except Exception as e:
+            w.error('Exception caught: ' + e.message)
+
+if __name__ == '__main__':
+    main()
+

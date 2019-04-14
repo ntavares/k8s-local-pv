@@ -1,0 +1,12 @@
+{{- if .Values.developerMode }}
+WARNING: developerMode is ON, which means the provisioner is not actively listening. This mode allows you to connect to a node and debug:
+
+  MYNODE=pvdevsysk8s09
+  kubectl -n kube-system exec -it $(kubectl -n kube-system get pods -owide | grep local-pv | awk "/$MYNODE/{print \$1;}") /k8s-local-pv
+
+There are a few tests under the test/ folder. If you find other relevant tests, please add them there.
+{{- else }}
+Portavita's k8s-local-pv PersistentVolume provisioner should be active in a while.
+{{- end }}
+
+See chart's README.md for KNOWN ISSUES.

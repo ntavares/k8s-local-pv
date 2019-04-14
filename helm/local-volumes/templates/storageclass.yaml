@@ -1,0 +1,12 @@
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: {{ .Values.storageClass }}
+  labels:
+    app: {{ template "local-volumes.name" . }}
+    chart: {{ template "local-volumes.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer

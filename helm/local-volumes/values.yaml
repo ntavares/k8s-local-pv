@@ -1,0 +1,12 @@
+
+storageClass: example-local-class-name
+size: 1Gi
+fs: xfs
+opts: ""
+mountOpts: noexec
+vg: storage_bulk
+nodes:
+  - node04
+  - node05
+  - node06
+

@@ -1,0 +1,133 @@
+#
+# This example pre-loads several PersistentVolumes to be used on a StatefulSet
+#
+# Notice how/why we define a specific storageclass for this group of PVs.
+# This will grant us a (dedicated) pool of volumes for the generated PVCs
+#
+# REQUIRED: To define (and use) your own storageclass
+#
+# After testing, clean up with:
+# kubectl delete statefulsets test-local-pv-statefulset-app
+# kubectl delete pvc test-local-pv-test-local-pv-statefulset-app-0 test-local-pv-test-local-pv-statefulset-app-1 test-local-pv-test-local-pv-statefulset-app-2
+# kubectl delete pv test-local-pv-statefulset-vol-0 test-local-pv-statefulset-vol-1 test-local-pv-statefulset-vol-2
+#
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+  name: test-local-pv-statefulset-vol-0
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 1Gi
+  local:
+    path: /mnt/pv/test-local-pv-statefulset-vol-0
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node08
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: test-local-pv-statefulset-storageclass
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+  name: test-local-pv-statefulset-vol-1
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 1Gi
+  local:
+    path: /mnt/pv/test-local-pv-statefulset-vol-1
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node07
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: test-local-pv-statefulset-storageclass
+
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  annotations:
+  name: test-local-pv-statefulset-vol-2
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 1Gi
+  local:
+    path: /mnt/pv/test-local-pv-statefulset-vol-2
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node06
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: test-local-pv-statefulset-storageclass
+
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: test-local-pv-statefulset-storageclass
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: test-local-pv-statefulset-app
+  labels:
+    app: test-local-pv-statefulset-app
+spec:
+  serviceName: "test-local-pv-statefulset-app"
+  selector:
+    matchLabels:
+      app: test-local-pv-statefulset-app
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: test-local-pv-statefulset-app
+    spec:
+      containers:
+      - name: example-app
+        image: localhost:30400/busybox:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        args:
+        - "-c"
+        - "while true; do sleep 10 ; done"
+        ports:
+        volumeMounts:
+        - name: test-local-pv
+          mountPath: /mnt
+  volumeClaimTemplates:
+  - metadata:
+      name: test-local-pv
+    spec:
+      storageClassName: test-local-pv-statefulset-storageclass
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi

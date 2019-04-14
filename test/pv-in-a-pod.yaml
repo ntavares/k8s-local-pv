@@ -1,0 +1,83 @@
+#
+# This example loads a PersistentVolume and integrates it into a Pod
+#
+#
+# REQUIRED: local.path to contain MOUNTBASEPATH/PVNAME (although it's only used internally by Kubernetes during PVC binding, which attempts to bind mount against local.path)
+#
+# After testing, clean up with:
+# kubectl delete pod test-local-pv-vol-app ; kubectl delete pvc test-local-pv-vol-pvc; kubectl delete pv test-local-pv-vol
+#
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: test-local-pv-vol
+  annotations:
+     local-pv.k8s.portavita.net/fsType: ext4
+     local-pv.k8s.portavita.net/fsOpts: -m 0
+     local-pv.k8s.portavita.net/mountOpts: noexec
+     local-pv.k8s.portavita.net/vg: storage_bulk
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: k8s-local-pv
+  local:
+    path: /mnt/pv/test-local-pv-vol
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node-id.k8s.portavita.net/nodeid
+          operator: In
+          values:
+          - node09
+
+#
+# From here on, it is basically a regular user Pod that wants to attach to
+# on of the PersistentVolume above
+#
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+  labels:
+    app: test-local-pv-vol-app
+  name: test-local-pv-vol-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: k8s-local-pv
+  volumeName: test-local-pv-vol
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-local-pv-vol-app
+  labels:
+    app: test-local-pv-vol-app
+spec:
+  containers:
+  - name: example-app
+    image: localhost:30400/busybox:latest
+    imagePullPolicy: IfNotPresent
+    command:
+    - sh
+    args:
+    - "-c"
+    - "while true; do sleep 10 ; done"
+    volumeMounts:
+    - name: test-local-pv-vol-pvc-vol
+      mountPath: /mnt
+  volumes:
+    - name: test-local-pv-vol-pvc-vol
+      persistentVolumeClaim:
+        claimName: test-local-pv-vol-pvc

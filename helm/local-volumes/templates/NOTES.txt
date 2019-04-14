@@ -1,0 +1,3 @@
+Get the status of your PVs with:
+    kubectl -n kube-system get pv -l 'app={{ $.Release.Name }}-{{ $.Chart.Name }}-{{ $.Chart.Version | replace "+" "_" }}' -o yaml | grep /status
+
